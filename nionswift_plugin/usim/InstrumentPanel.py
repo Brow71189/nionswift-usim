@@ -65,7 +65,7 @@ class InstrumentWidget(Widgets.CompositeWidgetBase):
         beam_shift_widget = PositionWidget(ui, _("Beam"), instrument, "beam_shift_m")
 
         defocus_field = ui.create_line_edit_widget()
-        defocus_field.bind_text(Binding.PropertyBinding(instrument, "defocus_m", converter=Converter.PhysicalValueToStringConverter(units="nm", multiplier=1E9)))
+        defocus_field.bind_text(Binding.PropertyBinding(instrument, "c10", converter=Converter.PhysicalValueToStringConverter(units="nm", multiplier=1E9)))
 
         c12_widget = PositionWidget(ui, _("C12"), instrument, "c12")
 
