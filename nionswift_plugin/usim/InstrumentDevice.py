@@ -642,18 +642,6 @@ class Instrument(stem_controller.STEMController):
         self.property_changed_event = Event.Event()
         self.__camera_frame_event = threading.Event()
         self.__features = list()
-        stage_size_nm = 150
-        sample_size_m = Geometry.FloatSize(height=20, width=20) / 1E9
-        feature_percentage = 0.3
-        random_state = random.getstate()
-        random.seed(1)
-        energies = [[(68, 30), (855, 50), (872, 50)], [(29, 15), (1217, 50), (1248, 50)], [(1839, 5), (99, 50)]]  # Ni, Ge, Si
-        plasmons = [20, 16.2, 16.8]
-        for i in range(100):
-            position_m = Geometry.FloatPoint(y=(2 * random.random() - 1.0) * sample_size_m.height, x=(2 * random.random() - 1.0) * sample_size_m.width)
-            size_m = feature_percentage * Geometry.FloatSize(height=random.random() * sample_size_m.height, width=random.random() * sample_size_m.width)
-            self.__features.append(Feature(position_m, size_m, energies[i%len(energies)], plasmons[i%len(energies)], 4))
-        random.setstate(random_state)
         self.__stage_position_m = Geometry.FloatPoint()
         self.__beam_shift_m = Geometry.FloatPoint()
         self.__convergence_angle_rad = 30 / 1000
@@ -667,21 +655,34 @@ class Instrument(stem_controller.STEMController):
         self.__c2_range = 300e-9
         self.__c3_range = 17e-6
         self.__slit_in = False
-        self.__eels_shape = Geometry.IntSize(256, 1024)
         self.__energy_per_channel_eV = 0.5
-        self.__ronchigram_shape = Geometry.IntSize(2048, 2048)
         self.__voltage = 100000
         self.__beam_current = 200E-12  # 200 pA
         self.__blanked = False
-        self.__ronchigram_shape = Geometry.IntSize(2048, 2048)
         self.__max_defocus = 5000 / 1E9
-        self.__eels_shape = Geometry.IntSize(256, 1024)
         self.__last_scan_params = None
         self.__live_probe_position = None
-        self.__tv_pixel_angle = math.asin(stage_size_nm / (self.__max_defocus * 1E9)) / self.__ronchigram_shape.height
         self.__sequence_progress = 0
         self.__lock = threading.Lock()
-
+        # some constants we need to initialize everything
+        stage_size_nm = 150
+        ronchigram_shape = Geometry.IntSize(2048, 2048)
+        tv_pixel_angle = math.asin(stage_size_nm / (self.__max_defocus * 1E9)) / ronchigram_shape.height
+        eels_shape = Geometry.IntSize(256, 1024)
+        theta = tv_pixel_angle * ronchigram_shape.height / 2  # half angle on camera
+        sample_size_m = Geometry.FloatSize(height=20, width=20) / 1E9
+        feature_percentage = 0.3
+        random_state = random.getstate()
+        random.seed(1)
+        energies = [[(68, 30), (855, 50), (872, 50)], [(29, 15), (1217, 50), (1248, 50)], [(1839, 5), (99, 50)]]  # Ni, Ge, Si
+        plasmons = [20, 16.2, 16.8]
+        # now create the features that we will see on the cameras and the scan
+        for i in range(100):
+            position_m = Geometry.FloatPoint(y=(2 * random.random() - 1.0) * sample_size_m.height, x=(2 * random.random() - 1.0) * sample_size_m.width)
+            size_m = feature_percentage * Geometry.FloatSize(height=random.random() * sample_size_m.height, width=random.random() * sample_size_m.width)
+            self.__features.append(Feature(position_m, size_m, energies[i%len(energies)], plasmons[i%len(energies)], 4))
+        random.setstate(random_state)
+        # here we define all controls
         zlp_tare_control = Control("ZLPtare")
         zlp_offset_control = Control("ZLPoffset", -20, [(zlp_tare_control, 1.0)])
         c10 = Control("C10", 500 / 1e9)
@@ -737,17 +738,22 @@ class Instrument(stem_controller.STEMController):
             "C34Control.x": c34Control_x,
             "C34Control.y": c34Control_y,
             }
-
+        # create the appropriate properties so that commands like "self.C10" work
         self.__create_control_properties()
+        # here we connect the controls with the stem_controller
+        def control_changed(control: Control) -> None:
+            self.property_changed_event.fire(control.name)
 
-        theta = self.__tv_pixel_angle * self.__ronchigram_shape.height / 2  # half angle on camera
-        self.__aberrations_controller = AberrationsController(self.__ronchigram_shape[0], self.__ronchigram_shape[1], theta, self.__max_defocus, self.defocus_m)
-
-        self.__cameras = {"ronchigram": RonchigramCameraSimulator(self.__ronchigram_shape,
-                                                                  self.counts_per_electron, self.__tv_pixel_angle,
-                                                                  self.__convergence_angle_rad, self.__max_defocus,
-                                                                  self.__aberrations_controller),
-                          "eels": EELSCameraSimulator(self.__eels_shape, self.counts_per_electron)}
+        for control in self.__controls.values():
+            control.on_changed = control_changed
+        # now that all controls are active we can create the aberrations controller
+        self.__aberrations_controller = AberrationsController(ronchigram_shape[0], ronchigram_shape[1], theta,
+                                                              self.__max_defocus, self.defocus_m)
+        # finally, create the cameras and then all connections to make them react to parameter changes
+        self.__cameras = {"ronchigram": RonchigramCameraSimulator(ronchigram_shape, self.counts_per_electron,
+                                                                  tv_pixel_angle, self.__convergence_angle_rad,
+                                                                  self.__max_defocus, self.__aberrations_controller),
+                          "eels": EELSCameraSimulator(eels_shape, self.counts_per_electron)}
 
         def property_changed(name):
             for camera in self.__cameras.values():
@@ -763,11 +769,6 @@ class Instrument(stem_controller.STEMController):
             for attr in camera.depends_on:
                 property_changed(attr)
 
-        def control_changed(control: Control) -> None:
-            self.property_changed_event.fire(control.name)
-
-        for control in self.__controls.values():
-            control.on_changed = control_changed
         # we also need to inform the cameras about changes to the (parked) probe position
         def probe_state_changed(probe_state, probe_position):
             property_changed("probe_state")
@@ -894,10 +895,6 @@ class Instrument(stem_controller.STEMController):
         readout_area = self.__cameras[camera_type].readout_area
         # returns readout area TLBR
         return readout_area.top, readout_area.left, readout_area.bottom, readout_area.right
-        if camera_type == "ronchigram":
-            return 0, 0, self.__ronchigram_shape[0], self.__ronchigram_shape[1]
-        else:
-            return 0, 0, self.__eels_shape[0], self.__eels_shape[1]
 
     @property
     def counts_per_electron(self):
