@@ -380,18 +380,22 @@ class CameraSimulator:
 
     def __init__(self, camera_type: str, sensor_dimensions: Geometry.IntSize, counts_per_electron: int):
         self._camera_type = camera_type
-        self._sensor_dimensions = sensor_dimensions
+        self.sensor_dimensions = sensor_dimensions
         self._counts_per_electron = counts_per_electron
         self._needs_recalculation = False
         self._cached_frame = None
         self.__dependent_properties = dict()
         self._camera_frame_event = threading.Event()
-        self._last_frame_settings = [Geometry.IntRect((0, 0), (0, 0)), Geometry.IntSize(), 0.0, None]
+        self._last_frame_settings = [Geometry.IntRect((0, 0), self.sensor_dimensions), Geometry.IntSize(1, 1), 0.0, None]
 
     def __getattr__(self, attr):
         if attr in self.__dependent_properties:
             return self.__dependent_properties[attr]
         raise AttributeError(attr)
+
+    @property
+    def readout_area(self):
+        return self._last_frame_settings[0]
 
     def notify_property_changed(self, property_name, new_value):
         #print(f"property changed: {property_name}, {new_value}, {self.__dependent_properties.get(property_name)}")
@@ -467,8 +471,8 @@ class RonchigramCameraSimulator(CameraSimulator):
             width = readout_area.width
             offset_m = self.stage_position_m
             full_fov_nm = abs(self.__max_defocus) * math.sin(self.__convergence_angle_rad) * 1E9
-            fov_size_nm = Geometry.FloatSize(full_fov_nm * height / self._sensor_dimensions.height, full_fov_nm * width / self._sensor_dimensions.width)
-            center_nm = Geometry.FloatPoint(full_fov_nm * (readout_area.center.y / self._sensor_dimensions.height- 0.5), full_fov_nm * (readout_area.center.x / self._sensor_dimensions.width - 0.5))
+            fov_size_nm = Geometry.FloatSize(full_fov_nm * height / self.sensor_dimensions.height, full_fov_nm * width / self.sensor_dimensions.width)
+            center_nm = Geometry.FloatPoint(full_fov_nm * (readout_area.center.y / self.sensor_dimensions.height- 0.5), full_fov_nm * (readout_area.center.x / self.sensor_dimensions.width - 0.5))
             size = Geometry.IntSize(height, width)
             data = numpy.zeros((height, width), numpy.float32)
             # features will be positive values; thickness can be simulated by subtracting the features from the
@@ -497,7 +501,7 @@ class RonchigramCameraSimulator(CameraSimulator):
                                                             probe_position[1]*scan_fov_size_nm[1] - scan_fov_size_nm[1]/2))
                     scan_offset = scan_offset*1e-9
 
-                theta = self.__tv_pixel_angle * self._sensor_dimensions.height / 2  # half angle on camera
+                theta = self.__tv_pixel_angle * self.sensor_dimensions.height / 2  # half angle on camera
                 aberrations = dict()
                 aberrations["height"] = data.shape[0]
                 aberrations["width"] = data.shape[1]
@@ -521,7 +525,9 @@ class RonchigramCameraSimulator(CameraSimulator):
             intensity_calibration = Calibration.Calibration(units="counts")
             dimensional_calibrations = self.get_dimensional_calibrations(readout_area, binning_shape)
 
-            self._cached_frame = DataAndMetadata.new_data_and_metadata(data.astype(numpy.float32), intensity_calibration=intensity_calibration, dimensional_calibrations=dimensional_calibrations)
+            self._cached_frame = DataAndMetadata.new_data_and_metadata(data.astype(numpy.float32),
+                                                                       intensity_calibration=intensity_calibration,
+                                                                       dimensional_calibrations=dimensional_calibrations)
             self.__data_scale = self.get_total_counts(exposure_s) / (data.shape[0] * data.shape[1] * thickness_param)
             self._needs_recalculation = False
 
@@ -536,10 +542,10 @@ class RonchigramCameraSimulator(CameraSimulator):
 
     def get_dimensional_calibrations(self, readout_area: Geometry.IntRect, binning_shape: Geometry.IntSize):
         binning_shape = binning_shape if binning_shape else Geometry.IntSize(1, 1)
-        height = readout_area.height if readout_area else self._sensor_dimensions[0]
-        width = readout_area.width if readout_area else self._sensor_dimensions[1]
-        full_fov_nm = abs(self.C10.output_value) * math.sin(self.__tv_pixel_angle * self._sensor_dimensions.height) * 1E9
-        fov_nm = Geometry.FloatSize(full_fov_nm * height / self._sensor_dimensions.height, full_fov_nm * width / self._sensor_dimensions.width)
+        height = readout_area.height if readout_area else self.sensor_dimensions[0]
+        width = readout_area.width if readout_area else self.sensor_dimensions[1]
+        full_fov_nm = abs(self.C10.output_value) * math.sin(self.__tv_pixel_angle * self.sensor_dimensions.height) * 1E9
+        fov_nm = Geometry.FloatSize(full_fov_nm * height / self.sensor_dimensions.height, full_fov_nm * width / self.sensor_dimensions.width)
         scale_y = binning_shape[0] * fov_nm[0] / height
         scale_x = binning_shape[1] * fov_nm[1] / width
         scale_y = scale_x = self.__tv_pixel_angle
@@ -569,7 +575,7 @@ class EELSCameraSimulator(CameraSimulator):
         self._last_frame_settings = new_frame_settings
 
         if self._needs_recalculation or self._cached_frame is None:
-            data = numpy.zeros(tuple(self._sensor_dimensions), numpy.float)
+            data = numpy.zeros(tuple(self.sensor_dimensions), numpy.float)
             slit_attenuation = 10 if self.is_slit_in else 1
             intensity_calibration = Calibration.Calibration(units="counts")
             dimensional_calibrations = self.get_dimensional_calibrations(readout_area, binning_shape)
@@ -605,7 +611,7 @@ class EELSCameraSimulator(CameraSimulator):
                                                                        intensity_calibration=intensity_calibration,
                                                                        dimensional_calibrations=dimensional_calibrations)
             self.__data_scale = (self.get_total_counts(exposure_s) / feature_pixel_count / slit_attenuation /
-                                 self._sensor_dimensions[0])
+                                 self.sensor_dimensions[0])
             self._needs_recalculation = False
 
         poisson_level = self.__data_scale + 5  # camera noise
@@ -882,13 +888,12 @@ class Instrument(stem_controller.STEMController):
         return data
 
     def camera_sensor_dimensions(self, camera_type: str) -> typing.Tuple[int, int]:
-        if camera_type == "ronchigram":
-            return self.__ronchigram_shape[0], self.__ronchigram_shape[1]
-        else:
-            return self.__eels_shape[0], self.__eels_shape[1]
+        self.__cameras[camera_type].sensor_dimensions
 
     def camera_readout_area(self, camera_type: str) -> typing.Tuple[int, int, int, int]:
+        readout_area = self.__cameras[camera_type].readout_area
         # returns readout area TLBR
+        return readout_area.top, readout_area.left, readout_area.bottom, readout_area.right
         if camera_type == "ronchigram":
             return 0, 0, self.__ronchigram_shape[0], self.__ronchigram_shape[1]
         else:
