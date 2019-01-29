@@ -375,6 +375,255 @@ class Control:
                 dependent._notify_change()
 
 
+class CameraSimulator:
+    depends_on = list() # subclasses should define the controls and attributes they depend on here
+
+    def __init__(self, camera_type: str, sensor_dimensions: Geometry.IntSize, counts_per_electron: int):
+        self._camera_type = camera_type
+        self._sensor_dimensions = sensor_dimensions
+        self._counts_per_electron = counts_per_electron
+        self._needs_recalculation = False
+        self._cached_frame = None
+        self.__dependent_properties = dict()
+        self._camera_frame_event = threading.Event()
+        self._last_frame_settings = [Geometry.IntRect((0, 0), (0, 0)), Geometry.IntSize(), 0.0, None]
+
+    def __getattr__(self, attr):
+        if attr in self.__dependent_properties:
+            return self.__dependent_properties[attr]
+        raise AttributeError(attr)
+
+    def notify_property_changed(self, property_name, new_value):
+        #print(f"property changed: {property_name}, {new_value}, {self.__dependent_properties.get(property_name)}")
+        if property_name in self.depends_on:
+            if (type(new_value) is not type(self.__dependent_properties.get(property_name)) or
+                new_value != self.__dependent_properties.get(property_name)):
+                # we need to copy the values to be sure we can detect changes (e.g. for a control, usually only its
+                # attributes will be changed, so we would not detect the change to it here since our stored value
+                # would only be a reference to the same Control object)
+                self.__dependent_properties[property_name] = copy.deepcopy(new_value)
+                self._needs_recalculation = True
+            # make sure we also initialize properties that have None values
+            elif property_name not in self.__dependent_properties:
+                self.__dependent_properties[property_name] = copy.deepcopy(new_value)
+                self._needs_recalculation = True
+
+    def get_dimensional_calibrations(self, readout_area: Geometry.IntRect, binning_shape: Geometry.IntSize):
+        """
+        Subclasses should override this method
+        """
+        return [{}, {}]
+
+    def get_frame_data(self, readout_area: Geometry.IntRect, binning_shape: Geometry.IntSize, exposure_s: float,
+                       last_scan_params=None) -> DataAndMetadata.DataAndMetadata:
+        """
+        Subclasses must override this method
+        """
+        raise NotImplementedError
+
+    def get_total_counts(self, exposure_s: float) -> float:
+        beam_current_pa = self.beam_current * 1E12
+        e_per_pa = 6.242E18 / 1E12
+        return beam_current_pa * e_per_pa * exposure_s * self._counts_per_electron
+
+    def _get_binned_data(self, data: numpy.ndarray, binning_shape: Geometry.IntSize) -> numpy.ndarray:
+        if binning_shape.height > 1:
+            # do binning by taking the binnable area, reshaping last dimension into bins, and taking sum of those bins.
+            data_T = data.T
+            data = data_T[:(data_T.shape[0] // binning_shape.height) * binning_shape.height].reshape(data_T.shape[0], -1, binning_shape.height).sum(axis=-1).T
+            if binning_shape.width > 1:
+                data = data[:(data.shape[-1] // binning_shape.width) * binning_shape.width].reshape(data.shape[0], -1, binning_shape.width).sum(axis=-1)
+        return data
+
+
+class RonchigramCameraSimulator(CameraSimulator):
+    depends_on = ["C10", "C12", "C21", "C23", "C30", "C32", "C34", "C34", "stage_position_m", "probe_state",
+                  "probe_position", "live_probe_position", "features", "beam_shift_m", "is_blanked", "beam_current"]
+
+    def __init__(self, sensor_dimensions: Geometry.IntSize, counts_per_electron: int, tv_pixel_angle: float,
+                 convergence_angle: float, max_defocus: float, aberrations_controller):
+        super().__init__("ronchigram", sensor_dimensions, counts_per_electron)
+        self.__tv_pixel_angle = tv_pixel_angle
+        self.__convergence_angle_rad = convergence_angle
+        self.__max_defocus = max_defocus
+        self.__aberrations_controller = aberrations_controller
+        self.__data_scale = 1.0
+
+    def get_frame_data(self, readout_area: Geometry.IntRect, binning_shape: Geometry.IntSize, exposure_s: float,
+                       last_scan_params=None) -> DataAndMetadata.DataAndMetadata:
+        #import time
+        #t0 = time.perf_counter()
+        #t1 = numpy.nan
+        # check if one of the arguments has changed since last call
+        new_frame_settings = [readout_area, binning_shape, exposure_s, last_scan_params]
+        if new_frame_settings != self._last_frame_settings:
+            self._needs_recalculation = True
+        self._last_frame_settings = new_frame_settings
+
+        if self._needs_recalculation or self._cached_frame is None:
+            #print("recalculating frame")
+            #t1 = time.perf_counter()
+            height = readout_area.height
+            width = readout_area.width
+            offset_m = self.stage_position_m
+            full_fov_nm = abs(self.__max_defocus) * math.sin(self.__convergence_angle_rad) * 1E9
+            fov_size_nm = Geometry.FloatSize(full_fov_nm * height / self._sensor_dimensions.height, full_fov_nm * width / self._sensor_dimensions.width)
+            center_nm = Geometry.FloatPoint(full_fov_nm * (readout_area.center.y / self._sensor_dimensions.height- 0.5), full_fov_nm * (readout_area.center.x / self._sensor_dimensions.width - 0.5))
+            size = Geometry.IntSize(height, width)
+            data = numpy.zeros((height, width), numpy.float32)
+            # features will be positive values; thickness can be simulated by subtracting the features from the
+            # vacuum value. the higher the vacuum value, the thinner (i.e. less contribution from features).
+            thickness_param = 100
+            feature_pixel_count = 0
+            if self.is_blanked:
+                feature_pixel_count = 1
+            else:
+                for feature in self.features:
+                    feature_pixel_count += feature.plot(data, offset_m, fov_size_nm, center_nm, size)
+                data = thickness_param - data
+            data = self._get_binned_data(data, binning_shape)
+
+            if not self.is_blanked:
+                probe_position = Geometry.FloatPoint(0.5, 0.5)
+                if self.probe_state == "scanning":
+                    probe_position = self.live_probe_position
+                elif self.probe_state == "parked" and self.probe_position is not None:
+                    probe_position = self.probe_position
+
+                scan_offset = Geometry.FloatPoint()
+                if last_scan_params is not None and probe_position is not None:
+                    scan_size, scan_fov_size_nm, scan_center_nm = last_scan_params  # get these from last scan
+                    scan_offset = Geometry.FloatPoint.make((probe_position[0]*scan_fov_size_nm[0] - scan_fov_size_nm[0]/2,
+                                                            probe_position[1]*scan_fov_size_nm[1] - scan_fov_size_nm[1]/2))
+                    scan_offset = scan_offset*1e-9
+
+                theta = self.__tv_pixel_angle * self._sensor_dimensions.height / 2  # half angle on camera
+                aberrations = dict()
+                aberrations["height"] = data.shape[0]
+                aberrations["width"] = data.shape[1]
+                aberrations["theta"] = theta
+                aberrations["c0a"] = self.beam_shift_m[1] + scan_offset[1]
+                aberrations["c0b"] = self.beam_shift_m[0] + scan_offset[0]
+                aberrations["c10"] = self.C10.output_value
+                aberrations["c12a"] = self.C12[1]
+                aberrations["c12b"] = self.C12[0]
+                aberrations["c21a"] = self.C21[1]
+                aberrations["c21b"] = self.C21[0]
+                aberrations["c23a"] = self.C23[1]
+                aberrations["c23b"] = self.C23[0]
+                aberrations["c30"] = self.C30.output_value
+                aberrations["c32a"] = self.C32[1]
+                aberrations["c32b"] = self.C32[0]
+                aberrations["c34a"] = self.C34[1]
+                aberrations["c34b"] = self.C34[0]
+                data = self.__aberrations_controller.apply(aberrations, data)
+
+            intensity_calibration = Calibration.Calibration(units="counts")
+            dimensional_calibrations = self.get_dimensional_calibrations(readout_area, binning_shape)
+
+            self._cached_frame = DataAndMetadata.new_data_and_metadata(data.astype(numpy.float32), intensity_calibration=intensity_calibration, dimensional_calibrations=dimensional_calibrations)
+            self.__data_scale = self.get_total_counts(exposure_s) / (data.shape[0] * data.shape[1] * thickness_param)
+            self._needs_recalculation = False
+
+        #t2 = time.perf_counter()
+        rs = numpy.random.RandomState()  # use this to avoid blocking other calls to poisson
+        return_frame = self._cached_frame * self.__data_scale + rs.poisson(self.__data_scale,
+                                                                           size=self._cached_frame.data.shape)
+        return_frame = return_frame - self.__data_scale
+        #t3 = time.perf_counter()
+        #print("timings: total: {:g}, calculation: {:g}, noise: {:g}".format(t3-t0, t2-t1, t3-t2))
+        return return_frame
+
+    def get_dimensional_calibrations(self, readout_area: Geometry.IntRect, binning_shape: Geometry.IntSize):
+        binning_shape = binning_shape if binning_shape else Geometry.IntSize(1, 1)
+        height = readout_area.height if readout_area else self._sensor_dimensions[0]
+        width = readout_area.width if readout_area else self._sensor_dimensions[1]
+        full_fov_nm = abs(self.C10.output_value) * math.sin(self.__tv_pixel_angle * self._sensor_dimensions.height) * 1E9
+        fov_nm = Geometry.FloatSize(full_fov_nm * height / self._sensor_dimensions.height, full_fov_nm * width / self._sensor_dimensions.width)
+        scale_y = binning_shape[0] * fov_nm[0] / height
+        scale_x = binning_shape[1] * fov_nm[1] / width
+        scale_y = scale_x = self.__tv_pixel_angle
+        offset_y = -scale_y * height * 0.5
+        offset_x = -scale_x * width * 0.5
+        dimensional_calibrations = [
+            Calibration.Calibration(offset=offset_y, scale=scale_y, units="rad"),
+            Calibration.Calibration(offset=offset_x, scale=scale_x, units="rad")
+        ]
+        return dimensional_calibrations
+
+
+class EELSCameraSimulator(CameraSimulator):
+    depends_on = ["is_slit_in", "probe_state", "probe_position", "is_blanked", "ZLPoffset", "stage_position_m",
+                  "beam_shift_m", "features", "energy_offset_eV", "energy_per_channel_eV", "beam_current"]
+
+    def __init__(self, sensor_dimensions: Geometry.IntSize, counts_per_electron: int):
+        super().__init__("eels", sensor_dimensions, counts_per_electron)
+        self.__data_scale = 1.0
+
+    def get_frame_data(self, readout_area: Geometry.IntRect, binning_shape: Geometry.IntSize, exposure_s: float,
+                       last_scan_params=None):
+        # check if one of the arguments has changed since last call
+        new_frame_settings = [readout_area, binning_shape, exposure_s, last_scan_params]
+        if new_frame_settings != self._last_frame_settings:
+            self._needs_recalculation = True
+        self._last_frame_settings = new_frame_settings
+
+        if self._needs_recalculation or self._cached_frame is None:
+            data = numpy.zeros(tuple(self._sensor_dimensions), numpy.float)
+            slit_attenuation = 10 if self.is_slit_in else 1
+            intensity_calibration = Calibration.Calibration(units="counts")
+            dimensional_calibrations = self.get_dimensional_calibrations(readout_area, binning_shape)
+            probe_position = Geometry.FloatPoint(0.5, 0.5)
+            if self.is_blanked:
+                probe_position = None
+            elif self.probe_state == "scanning":
+                probe_position = self.live_probe_position
+            elif self.probe_state == "parked" and self.probe_position is not None:
+                probe_position = self.probe_position
+
+            if probe_position is not None:
+                spectrum = numpy.zeros((data.shape[1], ), numpy.float)
+                used_calibration = dimensional_calibrations[1]
+                used_calibration.offset = self.ZLPoffset.local_value
+                plot_norm(spectrum, 1.0, used_calibration, 0, 0.5 / slit_attenuation)
+                size, fov_size_nm, center_nm = last_scan_params  # get these from last scan
+                offset_m = self.stage_position_m - self.beam_shift_m  # get this from current values
+                mean_free_path = 100  # nm. (lambda values from back of Edgerton)
+                thickness = 50  # nm
+                # T/lambda = 0.25 0.5 typical values OLK
+                # ZLP to first plasmon (areas, total count) is T/lambda.
+                # Each plasmon is also reduce by T/L
+                for index, feature in enumerate(self.features):
+                    if feature.intersects(offset_m, fov_size_nm, center_nm, Geometry.FloatPoint.make(probe_position)):
+                        feature.plot_spectrum(spectrum, 1.0 / 10, used_calibration)
+                feature_pixel_count = max(numpy.sum(spectrum), 0.01)
+                data[:, ...] = spectrum
+            else:
+                feature_pixel_count = 1
+            data = self._get_binned_data(data, binning_shape)
+            self._cached_frame = DataAndMetadata.new_data_and_metadata(data.astype(numpy.float32),
+                                                                       intensity_calibration=intensity_calibration,
+                                                                       dimensional_calibrations=dimensional_calibrations)
+            self.__data_scale = (self.get_total_counts(exposure_s) / feature_pixel_count / slit_attenuation /
+                                 self._sensor_dimensions[0])
+            self._needs_recalculation = False
+
+        poisson_level = self.__data_scale + 5  # camera noise
+        rs = numpy.random.RandomState()  # use this to avoid blocking other calls to poisson
+        return_frame = self._cached_frame * self.__data_scale
+        return_frame = return_frame + (rs.poisson(poisson_level, size=self._cached_frame.data.shape) - poisson_level)
+        return return_frame
+
+    def get_dimensional_calibrations(self, readout_area: Geometry.IntRect, binning_shape: Geometry.IntSize):
+        energy_offset_eV = self.energy_offset_eV
+        # energy_offset_eV += random.uniform(-1, 1) * self.__energy_per_channel_eV * 5
+        dimensional_calibrations = [
+            Calibration.Calibration(),
+            Calibration.Calibration(offset=energy_offset_eV, scale=self.energy_per_channel_eV, units="eV")
+        ]
+        return dimensional_calibrations
+
+
 class Instrument(stem_controller.STEMController):
     """
     TODO: add temporal supersampling for cameras (to produce blurred data when things are changing).
@@ -488,12 +737,37 @@ class Instrument(stem_controller.STEMController):
         theta = self.__tv_pixel_angle * self.__ronchigram_shape.height / 2  # half angle on camera
         self.__aberrations_controller = AberrationsController(self.__ronchigram_shape[0], self.__ronchigram_shape[1], theta, self.__max_defocus, self.defocus_m)
 
+        self.__cameras = {"ronchigram": RonchigramCameraSimulator(self.__ronchigram_shape,
+                                                                  self.counts_per_electron, self.__tv_pixel_angle,
+                                                                  self.__convergence_angle_rad, self.__max_defocus,
+                                                                  self.__aberrations_controller),
+                          "eels": EELSCameraSimulator(self.__eels_shape, self.counts_per_electron)}
+
+        def property_changed(name):
+            for camera in self.__cameras.values():
+                if name in self.__controls:
+                    camera.notify_property_changed(name, self.__controls[name])
+                else:
+                    value = getattr(self, name)
+                    camera.notify_property_changed(name, value)
+        # listen to our own property_changed_event and inform the cameras about any changes
+        self.__property_changed_event_listener = self.property_changed_event.listen(property_changed)
+        # make sure cameras are in sync with controls and other parameters
+        for camera in self.__cameras.values():
+            for attr in camera.depends_on:
+                property_changed(attr)
 
         def control_changed(control: Control) -> None:
             self.property_changed_event.fire(control.name)
 
         for control in self.__controls.values():
             control.on_changed = control_changed
+        # we also need to inform the cameras about changes to the (parked) probe position
+        def probe_state_changed(probe_state, probe_position):
+            property_changed("probe_state")
+            property_changed("probe_position")
+        self.__probe_state_changed_event_listener = self.probe_state_changed_event.listen(probe_state_changed)
+
     def __create_control_properties(self):
         controls_added = []
         for name, control in self.__controls.items():
@@ -540,19 +814,18 @@ class Instrument(stem_controller.STEMController):
                 setattr(Instrument, name, property(make_getter(name), make_setter(name)))
                 controls_added.append(name)
 
-        self.__voltage = 100000
-        self.__beam_current = 200E-12  # 200 pA
-        self.__blanked = False
-        self.__ronchigram_shape = Geometry.IntSize(2048, 2048)
-        self.__max_defocus = 5000 / 1E9
-        self.__tv_pixel_angle = math.asin(stage_size_nm / (self.__max_defocus * 1E9)) / self.__ronchigram_shape.height
-        self.__eels_shape = Geometry.IntSize(256, 1024)
-        self.__last_scan_params = None
-        self.live_probe_position = None
-        theta = self.__tv_pixel_angle * self.__ronchigram_shape.height / 2  # half angle on camera
-        self.__aberrations_controller = AberrationsController(self.__ronchigram_shape[0], self.__ronchigram_shape[1], theta, self.__max_defocus, self.defocus_m)
-        self.__sequence_progress = 0
-        self.__lock = threading.Lock()
+    @property
+    def features(self):
+        return self.__features
+
+    @property
+    def live_probe_position(self):
+        return self.__live_probe_position
+
+    @live_probe_position.setter
+    def live_probe_position(self, position):
+        self.__live_probe_position = position
+        self.property_changed_event.fire("live_probe_position")
 
     @property
     def sequence_progress(self):
@@ -621,15 +894,6 @@ class Instrument(stem_controller.STEMController):
         else:
             return 0, 0, self.__eels_shape[0], self.__eels_shape[1]
 
-    def __get_binned_data(self, data: numpy.ndarray, binning_shape: Geometry.IntSize) -> numpy.ndarray:
-        if binning_shape.height > 1:
-            # do binning by taking the binnable area, reshaping last dimension into bins, and taking sum of those bins.
-            data_T = data.T
-            data = data_T[:(data_T.shape[0] // binning_shape.height) * binning_shape.height].reshape(data_T.shape[0], -1, binning_shape.height).sum(axis=-1).T
-            if binning_shape.width > 1:
-                data = data[:(data.shape[-1] // binning_shape.width) * binning_shape.width].reshape(data.shape[0], -1, binning_shape.width).sum(axis=-1)
-        return data
-
     @property
     def counts_per_electron(self):
         return 40
@@ -641,134 +905,11 @@ class Instrument(stem_controller.STEMController):
         e_per_pixel_per_second = beam_e / pixel_count
         return e_per_pixel_per_second * exposure_s
 
-    def get_total_counts(self, exposure_s: float) -> float:
-        beam_current_pa = self.__beam_current * 1E12
-        e_per_pa = 6.242E18 / 1E12
-        return beam_current_pa * e_per_pa * exposure_s * self.counts_per_electron
-
     def get_camera_data(self, camera_type: str, readout_area: Geometry.IntRect, binning_shape: Geometry.IntSize, exposure_s: float) -> DataAndMetadata.DataAndMetadata:
-        if camera_type == "ronchigram":
-            height = readout_area.height
-            width = readout_area.width
-            offset_m = self.stage_position_m
-            full_fov_nm = abs(self.__max_defocus) * math.sin(self.__convergence_angle_rad) * 1E9
-            fov_size_nm = Geometry.FloatSize(full_fov_nm * height / self.__ronchigram_shape.height, full_fov_nm * width / self.__ronchigram_shape.width)
-            center_nm = Geometry.FloatPoint(full_fov_nm * (readout_area.center.y / self.__ronchigram_shape.height- 0.5), full_fov_nm * (readout_area.center.x / self.__ronchigram_shape.width - 0.5))
-            size = Geometry.IntSize(height, width)
-            data = numpy.zeros((height, width), numpy.float32)
-            feature_pixel_count = 0
-            for feature in self.__features:
-                feature_pixel_count += feature.plot(data, offset_m, fov_size_nm, center_nm, size)
-            # features will be positive values; thickness can be simulated by subtracting the features from the
-            # vacuum value. the higher the vacuum value, the thinner (i.e. less contribution from features).
-            thickness_param = 100
-            data = thickness_param - data
-            data = self.__get_binned_data(data, binning_shape)
-            data_scale = self.get_total_counts(exposure_s) / (data.shape[0] * data.shape[1] * thickness_param)
-            rs = numpy.random.RandomState()  # use this to avoid blocking other calls to poisson
-            data = data * data_scale + rs.poisson(data_scale, size=data.shape) - data_scale
-            probe_position = Geometry.FloatPoint(0.5, 0.5)
-            if self.probe_state == "scanning":
-                probe_position = self.live_probe_position
-            elif self.probe_state == "parked" and self.probe_position is not None:
-                probe_position = self.probe_position
-
-            scan_offset = Geometry.FloatPoint()
-            if self.__last_scan_params is not None and probe_position is not None:
-                scan_size, scan_fov_size_nm, scan_center_nm = self.__last_scan_params  # get these from last scan
-                scan_offset = Geometry.FloatPoint.make((probe_position[0]*scan_fov_size_nm[0] - scan_fov_size_nm[0]/2,
-                                                        probe_position[1]*scan_fov_size_nm[1] - scan_fov_size_nm[1]/2))
-                scan_offset = scan_offset*1e-9
-
-            theta = self.__tv_pixel_angle * self.__ronchigram_shape.height / 2  # half angle on camera
-            aberrations = dict()
-            aberrations["height"] = data.shape[0]
-            aberrations["width"] = data.shape[1]
-            aberrations["theta"] = theta
-            aberrations["c0a"] = self.beam_shift_m[1] + scan_offset[1]
-            aberrations["c0b"] = self.beam_shift_m[0] + scan_offset[0]
-            aberrations["c10"] = self.defocus_m
-            aberrations["c12a"] = self.__c12[1]
-            aberrations["c12b"] = self.__c12[0]
-            aberrations["c21a"] = self.__c21[1]
-            aberrations["c21b"] = self.__c21[0]
-            aberrations["c23a"] = self.__c23[1]
-            aberrations["c23b"] = self.__c23[0]
-            aberrations["c30"] = self.__c30
-            aberrations["c32a"] = self.__c32[1]
-            aberrations["c32b"] = self.__c32[0]
-            aberrations["c34a"] = self.__c34[1]
-            aberrations["c34b"] = self.__c34[0]
-            data = self.__aberrations_controller.apply(aberrations, data)
-
-            intensity_calibration = Calibration.Calibration(units="counts")
-            dimensional_calibrations = self.get_camera_dimensional_calibrations(camera_type, readout_area, binning_shape)
-
-            return DataAndMetadata.new_data_and_metadata(data.astype(numpy.float32), intensity_calibration=intensity_calibration, dimensional_calibrations=dimensional_calibrations)
-        else:
-            data = numpy.zeros(tuple(self.__eels_shape), numpy.float)
-            slit_attenuation = 10 if self.__slit_in else 1
-            intensity_calibration = Calibration.Calibration(units="counts")
-            dimensional_calibrations = self.get_camera_dimensional_calibrations(camera_type, readout_area, binning_shape)
-            probe_position = self.probe_position
-            if self.__blanked:
-                probe_position = None
-            elif self.probe_state == "parked":
-                pass
-            elif self.probe_state == "scanning":
-                probe_position = self.live_probe_position
-            if probe_position is not None:
-                spectrum = numpy.zeros((data.shape[1], ), numpy.float)
-                used_calibration = dimensional_calibrations[1]
-                used_calibration.offset = self.__controls["ZLPoffset"].local_value
-                plot_norm(spectrum, 1.0, used_calibration, 0, 0.5 / slit_attenuation)
-                size, fov_size_nm, center_nm = self.__last_scan_params  # get these from last scan
-                offset_m = self.stage_position_m - self.beam_shift_m  # get this from current values
-                mean_free_path = 100  # nm. (lambda values from back of Edgerton)
-                thickness = 50  # nm
-                # T/lambda = 0.25 0.5 typical values OLK
-                # ZLP to first plasmon (areas, total count) is T/lambda.
-                # Each plasmon is also reduce by T/L
-                for index, feature in enumerate(self.__features):
-                    if feature.intersects(offset_m, fov_size_nm, center_nm, Geometry.FloatPoint.make(probe_position)):
-                        feature.plot_spectrum(spectrum, 1.0 / 10, used_calibration)
-                feature_pixel_count = max(numpy.sum(spectrum), 0.01)
-                data[:, ...] = spectrum
-            else:
-                feature_pixel_count = 1
-            data = self.__get_binned_data(data, binning_shape)
-            data_scale = self.get_total_counts(exposure_s) / feature_pixel_count / slit_attenuation / self.__eels_shape[0]
-            poisson_level = data_scale + 5  # camera noise
-            rs = numpy.random.RandomState()  # use this to avoid blocking other calls to poisson
-            data = data * data_scale + (rs.poisson(poisson_level, size=data.shape) - poisson_level)
-            return DataAndMetadata.new_data_and_metadata(data.astype(numpy.float32), intensity_calibration=intensity_calibration, dimensional_calibrations=dimensional_calibrations)
+        return self.__cameras[camera_type].get_frame_data(readout_area, binning_shape, exposure_s, self.__last_scan_params)
 
     def get_camera_dimensional_calibrations(self, camera_type: str, readout_area: Geometry.IntRect = None, binning_shape: Geometry.IntSize = None):
-        if camera_type == "ronchigram":
-            binning_shape = binning_shape if binning_shape else Geometry.IntSize(1, 1)
-            height = readout_area.height if readout_area else self.__ronchigram_shape[0]
-            width = readout_area.width if readout_area else self.__ronchigram_shape[1]
-            full_fov_nm = abs(self.defocus_m) * math.sin(self.__tv_pixel_angle * self.__ronchigram_shape.height) * 1E9
-            fov_nm = Geometry.FloatSize(full_fov_nm * height / self.__ronchigram_shape.height, full_fov_nm * width / self.__ronchigram_shape.width)
-            scale_y = binning_shape[0] * fov_nm[0] / height
-            scale_x = binning_shape[1] * fov_nm[1] / width
-            scale_y = scale_x = self.__tv_pixel_angle
-            offset_y = -scale_y * height * 0.5
-            offset_x = -scale_x * width * 0.5
-            dimensional_calibrations = [
-                Calibration.Calibration(offset=offset_y, scale=scale_y, units="rad"),
-                Calibration.Calibration(offset=offset_x, scale=scale_x, units="rad")
-            ]
-            return dimensional_calibrations
-        if camera_type == "eels":
-            energy_offset_eV = self.energy_offset_eV
-            # energy_offset_eV += random.uniform(-1, 1) * self.__energy_per_channel_eV * 5
-            dimensional_calibrations = [
-                Calibration.Calibration(),
-                Calibration.Calibration(offset=energy_offset_eV, scale=self.__energy_per_channel_eV, units="eV")
-            ]
-            return dimensional_calibrations
-        return [{}, {}]
+        return self.__cameras[camera_type].get_dimensional_calibrations(readout_area, binning_shape)
 
     @property
     def stage_position_m(self) -> Geometry.FloatPoint:
